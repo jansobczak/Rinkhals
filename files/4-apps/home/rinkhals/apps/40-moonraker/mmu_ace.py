@@ -591,14 +591,22 @@ def parse_anycubic_sku(sku: str) -> dict:
         "serial": serial
     }
 
+SPOOLMAN_FIELD_PRINTER_NAME = "printer_name"
+SPOOLMAN_FIELD_GATE_MAP = "mmu_gate_map"
+MIN_SPOOLMAN_VERSION = (0, 18, 1)
+DEFAULT_SPOOLMAN_PULL_INTERVAL = 5.0
+
 class MmuAceController:
     ace: MmuAce
     server: Any
 
     printer: PrinterController
 
-    def __init__(self, server: Server, host: str | None):
+    def __init__(self, server: Server, host: str | None, spoolman_support: str = "off", printer_name: str | None = None):
         self.server = server
+        self._spoolman_support = spoolman_support
+        self._printer_name_config = printer_name
+        self._printer_name: Optional[str] = None
         self.eventloop = self.server.get_event_loop()
         self._last_status_update = 0.0
         self._status_update_task: Optional[asyncio.Task] = None
@@ -626,6 +634,33 @@ class MmuAceController:
             self.printer = RemotePrinterController(self.server, host)
 
         self._last_gate_fingerprint: str = ""
+
+        # User-assigned Spoolman links per gate (gate_index -> {spool_id, material,
+        # filament_name, color, temperature, vendor}). Persisted across restarts AND
+        # restored on every _set_ace_status poll, since that rebuilds gate objects
+        # from scratch on every ACE status update - without restoring the full
+        # record (not just spool_id), the display fields pulled from Spoolman in
+        # update_gate() would revert to "Unknown" the moment the next poll arrives.
+        self._gate_spool_overrides: Dict[int, Dict[str, Any]] = {}
+        data_path = self.server.get_app_args().get("data_path", "/useremain/home/rinkhals/printer_data")
+        self._spool_overrides_path = os.path.join(data_path, "config", "mmu_ace_gate_spools.json")
+        self._load_gate_spool_overrides()
+
+        # Spoolman gate-assignment push/pull state. Mirrors Happy Hare's own
+        # push/pull spoolman_support modes: "push" writes this printer's local
+        # gate->spool_id links out to Spoolman's per-spool "extra" fields (and
+        # a human-readable location string); "pull" additionally treats
+        # Spoolman as authoritative and imports gate assignments from it into
+        # _spoolman_pull_cache, applied in _set_ace_status alongside (but at
+        # lower priority than) local manual overrides.
+        self._spoolman_pull_cache: Dict[int, Dict[str, Any]] = {}
+        self._spoolman_extras_ready = False
+        self._spoolman_extras_lock = asyncio.Lock()
+        self._spoolman_pull_interval: Optional[float] = None
+        if self._spoolman_support in ("push", "pull"):
+            asyncio.create_task(self._ensure_spoolman_extras())
+        if self._spoolman_support == "pull":
+            asyncio.create_task(self._spoolman_pull_refresh_loop())
 
         # Start periodic cache cleanup task (runs every 60 seconds)
         # Removes expired temperature cache entries to prevent slow memory leak
@@ -798,6 +833,309 @@ class MmuAceController:
 
         if expired_keys:
             logging.debug(f"Cache cleanup: Removed {len(expired_keys)} expired temperature entries")
+
+    def _load_gate_spool_overrides(self):
+        try:
+            with open(self._spool_overrides_path) as f:
+                raw = json.load(f)
+                overrides = {}
+                for k, v in raw.items():
+                    if isinstance(v, dict):
+                        overrides[int(k)] = v
+                    else:
+                        # Legacy format from before display fields were cached here -
+                        # material/name/etc. will read as "Unknown" until re-linked.
+                        overrides[int(k)] = {"spool_id": int(v)}
+                self._gate_spool_overrides = overrides
+            logging.info(f"[mmu_ace] Loaded gate spool overrides: {self._gate_spool_overrides}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Failed to load gate spool overrides: {e}")
+
+    def _save_gate_spool_overrides(self):
+        try:
+            with open(self._spool_overrides_path, 'w') as f:
+                json.dump({str(k): v for k, v in self._gate_spool_overrides.items()}, f)
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Failed to save gate spool overrides: {e}")
+
+    async def _resolve_printer_name(self) -> str:
+        """Resolve this printer's identity for Spoolman gate-assignment scoping.
+
+        Priority: explicit [mmu_ace] printer_name config > Fluidd's own
+        configured instance name (Settings -> General, stored server-side in
+        Moonraker's database) > this host's OS hostname. Stock Rinkhals/
+        Buildroot images all report the same generic hostname ("Rockchip"),
+        so falling back that far risks silently colliding gate assignments
+        across multiple printers that share one Spoolman instance.
+        """
+        if self._printer_name_config:
+            return self._printer_name_config
+
+        database = self.server.lookup_component('database', None)
+        if database is not None:
+            try:
+                fluidd_name = await database.get_item("fluidd", "uiSettings.general.instanceName", None)
+                if fluidd_name:
+                    return fluidd_name
+            except Exception as e:
+                logging.debug(f"[mmu_ace] Could not read Fluidd instance name: {e}")
+
+        hostname = ""
+        try:
+            hostname = self.server.get_host_info().get("hostname", "")
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Could not resolve printer hostname: {e}")
+
+        if not hostname or hostname == "Rockchip":
+            logging.warning(
+                f"[mmu_ace] printer_name resolved to {hostname!r} (a generic stock SoC "
+                "hostname, not a per-printer identifier). If more than one printer shares "
+                "this Spoolman instance, gate assignments can silently collide - set an "
+                "explicit unique printer_name under [mmu_ace], or a unique name in Fluidd's "
+                "Settings -> General."
+            )
+        return hostname
+
+    async def _get_spoolman_version(self) -> Optional[Tuple[int, int, int]]:
+        spoolman = self.server.lookup_component('spoolman', None)
+        http_client = self.server.lookup_component('http_client', None)
+        if spoolman is None or http_client is None:
+            return None
+        try:
+            response = await http_client.get(
+                f"{spoolman.spoolman_url}/v1/info",
+                connect_timeout=1., request_timeout=2.
+            )
+            if response.has_error():
+                return None
+            parts = tuple(int(p) for p in response.json()["version"].split("."))
+            return parts if len(parts) == 3 else None
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Failed to check Spoolman version: {e}")
+            return None
+
+    async def _get_spoolman_extra_fields(self, entity_type: str) -> Optional[List[str]]:
+        spoolman = self.server.lookup_component('spoolman', None)
+        http_client = self.server.lookup_component('http_client', None)
+        if spoolman is None or http_client is None:
+            return None
+        try:
+            response = await http_client.get(
+                f"{spoolman.spoolman_url}/v1/field/{entity_type}",
+                connect_timeout=1., request_timeout=2.
+            )
+            if response.has_error():
+                return None
+            return [f.get("key") for f in response.json()]
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Failed to list Spoolman extra fields: {e}")
+            return None
+
+    async def _add_spoolman_extra_field(self, entity_type: str, field_key: str, field_name: str, field_type: str, default_value: Any) -> bool:
+        spoolman = self.server.lookup_component('spoolman', None)
+        http_client = self.server.lookup_component('http_client', None)
+        if spoolman is None or http_client is None:
+            return False
+        try:
+            response = await http_client.request(
+                method="POST",
+                url=f"{spoolman.spoolman_url}/v1/field/{entity_type}/{field_key}",
+                body={"name": field_name, "field_type": field_type, "default_value": json.dumps(default_value)},
+                connect_timeout=1., request_timeout=2.
+            )
+            if response.has_error():
+                logging.warning(f"[mmu_ace] Failed to create Spoolman extra field {field_key!r}: {response.status_code}")
+                return False
+            return True
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Failed to create Spoolman extra field {field_key!r}: {e}")
+            return False
+
+    async def _ensure_spoolman_extras(self) -> bool:
+        """Lazily bootstrap Spoolman gate-assignment support: resolve this
+        printer's identity, check the Spoolman version, and make sure the
+        printer_name/mmu_gate_map extra fields exist on the spool entity type.
+
+        Never blocks startup. Safe to call repeatedly - a no-op once ready,
+        and a single retry attempt otherwise (push retries on the next edit,
+        pull retries on the next refresh tick, so no internal retry loop is
+        needed here).
+        """
+        if self._spoolman_extras_ready:
+            return True
+        async with self._spoolman_extras_lock:
+            if self._spoolman_extras_ready:
+                return True
+            if self._printer_name is None:
+                self._printer_name = await self._resolve_printer_name()
+
+            version = await self._get_spoolman_version()
+            if version is not None and version < MIN_SPOOLMAN_VERSION:
+                logging.warning(
+                    f"[mmu_ace] Spoolman version {'.'.join(map(str, version))} is older than "
+                    f"the minimum {'.'.join(map(str, MIN_SPOOLMAN_VERSION))} required for gate "
+                    "assignment push/pull support - skipping."
+                )
+                return False
+
+            existing = await self._get_spoolman_extra_fields("spool")
+            if existing is None:
+                return False
+            ok = True
+            if SPOOLMAN_FIELD_PRINTER_NAME not in existing:
+                ok = await self._add_spoolman_extra_field(
+                    "spool", SPOOLMAN_FIELD_PRINTER_NAME, "Printer Name", "text", ""
+                ) and ok
+            if SPOOLMAN_FIELD_GATE_MAP not in existing:
+                ok = await self._add_spoolman_extra_field(
+                    "spool", SPOOLMAN_FIELD_GATE_MAP, "MMU Gate", "integer", -1
+                ) and ok
+            self._spoolman_extras_ready = ok
+            return ok
+
+    async def _patch_spoolman_spool(self, spool_id: int, body: Dict[str, Any]) -> bool:
+        spoolman = self.server.lookup_component('spoolman', None)
+        http_client = self.server.lookup_component('http_client', None)
+        if spoolman is None or http_client is None:
+            return False
+        try:
+            response = await http_client.request(
+                method="PATCH",
+                url=f"{spoolman.spoolman_url}/v1/spool/{spool_id}",
+                body=body,
+                connect_timeout=1., request_timeout=2.
+            )
+            if response.has_error():
+                logging.warning(f"[mmu_ace] Failed to update Spoolman spool {spool_id}: {response.status_code}")
+                return False
+            return True
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Failed to update Spoolman spool {spool_id}: {e}")
+            return False
+
+    async def _spoolman_set_gate(self, spool_id: int, gate_index: int) -> bool:
+        if not await self._ensure_spoolman_extras():
+            return False
+        body = {
+            "extra": {
+                SPOOLMAN_FIELD_PRINTER_NAME: json.dumps(self._printer_name or ""),
+                SPOOLMAN_FIELD_GATE_MAP: json.dumps(gate_index),
+            },
+            "location": f"{self._printer_name} @ MMU Gate:{gate_index}",
+        }
+        return await self._patch_spoolman_spool(spool_id, body)
+
+    async def _spoolman_unset_gate(self, spool_id: int) -> bool:
+        if not await self._ensure_spoolman_extras():
+            return False
+        body = {
+            "extra": {
+                SPOOLMAN_FIELD_PRINTER_NAME: json.dumps(""),
+                SPOOLMAN_FIELD_GATE_MAP: json.dumps(-1),
+            },
+            "location": "",
+        }
+        return await self._patch_spoolman_spool(spool_id, body)
+
+    async def _spool_record_to_gate_fields(self, spool_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract gate-display fields from a Spoolman spool record.
+
+        Shared by update_gate()'s single-spool link path and the bulk
+        pull-cache refresh, so filament-attribute parsing only lives once.
+        """
+        filament = spool_info.get("filament", {})
+        fields: Dict[str, Any] = {"spool_id": spool_info.get("id")}
+        if filament.get("name"):
+            fields["filament_name"] = filament["name"]
+        if filament.get("material"):
+            fields["material"] = filament["material"]
+        vendor = (filament.get("vendor") or {}).get("name")
+        if vendor:
+            fields["vendor"] = vendor
+        extruder_temp = filament.get("settings_extruder_temp")
+        if extruder_temp is not None:
+            fields["temperature"] = extruder_temp
+        color_hex = filament.get("color_hex")
+        if color_hex:
+            fields["color"] = rgb_to_rgba(hex_to_rgb(color_hex))
+        return fields
+
+    async def _refresh_spoolman_pull_cache(self) -> None:
+        """Rebuild the local gate->spool-assignment cache from Spoolman's own
+        records (extra.printer_name / extra.mmu_gate_map), scoped to this
+        printer's identity. Spoolman is authoritative in "pull" mode.
+
+        On any failure, the existing cache is left untouched rather than
+        cleared - a transient network blip must not flicker every pulled
+        gate to "unassigned" for a cycle.
+        """
+        if not await self._ensure_spoolman_extras():
+            return
+        spoolman = self.server.lookup_component('spoolman', None)
+        http_client = self.server.lookup_component('http_client', None)
+        if spoolman is None or http_client is None:
+            return
+        try:
+            response = await http_client.get(
+                f"{spoolman.spoolman_url}/v1/spool",
+                connect_timeout=1., request_timeout=5.
+            )
+            if response.has_error():
+                logging.warning(f"[mmu_ace] Spoolman pull refresh failed: {response.status_code}")
+                return
+            records = response.json()
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Spoolman pull refresh failed: {e}")
+            return
+
+        new_cache: Dict[int, Dict[str, Any]] = {}
+        for spool_info in records:
+            extra = spool_info.get("extra", {}) or {}
+            try:
+                printer_name = json.loads(extra.get(SPOOLMAN_FIELD_PRINTER_NAME, '""'))
+            except (TypeError, ValueError):
+                printer_name = ""
+            try:
+                gate_index = int(extra.get(SPOOLMAN_FIELD_GATE_MAP, -1))
+            except (TypeError, ValueError):
+                gate_index = -1
+            if printer_name != self._printer_name or gate_index < 0:
+                continue
+            new_cache[gate_index] = await self._spool_record_to_gate_fields(spool_info)
+        self._spoolman_pull_cache = new_cache
+        logging.debug(f"[mmu_ace] Spoolman pull cache refreshed: {self._spoolman_pull_cache}")
+
+    async def _spoolman_pull_refresh_loop(self) -> None:
+        while True:
+            try:
+                if self._spoolman_pull_interval is None:
+                    spoolman = self.server.lookup_component('spoolman', None)
+                    self._spoolman_pull_interval = getattr(spoolman, "sync_rate_seconds", None) or DEFAULT_SPOOLMAN_PULL_INTERVAL
+                await self._refresh_spoolman_pull_cache()
+            except Exception as e:
+                logging.warning(f"[mmu_ace] Spoolman pull refresh loop error: {e}")
+            await asyncio.sleep(self._spoolman_pull_interval or DEFAULT_SPOOLMAN_PULL_INTERVAL)
+
+    async def _update_spoolman_active_spool(self, gate_index: int):
+        if self._spoolman_support not in ("push", "pull"):
+            return
+        gate_lookup = self._get_gate_by_index(gate_index)
+        if not gate_lookup:
+            return
+        _, gate = gate_lookup
+        spool_id = gate.spool_id
+        if spool_id <= 0:
+            return
+        spoolman = self.server.lookup_component('spoolman', None)
+        if spoolman is None:
+            return
+        try:
+            spoolman.set_active_spool(spool_id=spool_id)
+            logging.info(f"[mmu_ace] Spoolman active spool updated to {spool_id} (gate {gate_index})")
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Failed to update Spoolman active spool: {e}")
 
     async def _periodic_cache_cleanup(self):
         """Periodically clean up expired cache entries.
@@ -1000,8 +1338,11 @@ class MmuAceController:
                 current_filament = filament_hub.get("current_filament")
 
                 if current_filament is not None:
+                    prev_loaded_gate = self.ace.loaded_gate
                     self._sync_loaded_gate_from_current_filament(current_filament)
                     self._handle_status_update(force=True)
+                    if self.ace.loaded_gate != prev_loaded_gate and self.ace.loaded_gate >= 0:
+                        await self._update_spoolman_active_spool(self.ace.loaded_gate)
                 else:
                     logging.debug(
                         "Ignoring partial filament_hub update without current_filament: "
@@ -1050,7 +1391,10 @@ class MmuAceController:
                     elif temp_data:
                         slot["temperature"] = temp_data
 
+            prev_loaded_gate = self.ace.loaded_gate
             self._set_ace_status(filament_hub)
+            if self.ace.loaded_gate != prev_loaded_gate and self.ace.loaded_gate >= 0:
+                await self._update_spoolman_active_spool(self.ace.loaded_gate)
 
     async def _get_filament_temperature_info(self, unit_id: int, gate_index: int, sku: str) -> Optional[Dict[str, Any]]:
         """Get filament temperature info from ACE hardware with time-based caching.
@@ -1142,7 +1486,13 @@ class MmuAceController:
 
         self.ace.loaded_gate = global_gate
 
-        if self.ace.filament.pos != FILAMENT_POS_LOADED or self.ace.gate in [TOOL_GATE_UNKNOWN, previous_loaded_gate]:
+        # Only override the (possibly manually-selected) gate/tool when the
+        # hardware's actual loaded gate has genuinely changed, or wasn't known
+        # yet. filament.pos alone isn't a safe signal here: MMU_SELECT sets it
+        # to UNLOADED as a side effect of merely browsing to a gate, which
+        # previously caused that selection to be silently reverted back to
+        # whatever gate is physically loaded on the very next status poll.
+        if global_gate != previous_loaded_gate or self.ace.gate == TOOL_GATE_UNKNOWN:
             logging.info(f"_sync_loaded_gate_from_current_filament: ACE Hub current_filament='{current_filament}', setting MMU gate={global_gate}")
             self.ace.gate = global_gate
             self.ace.tool = global_gate  # Tool = Gate for ACE
@@ -1195,49 +1545,97 @@ class MmuAceController:
 
                 gate = MmuAceGate()
                 gate.index = index
-                gate.material = type
-                gate.filament_name = type
-                gate.color = rgb_to_rgba(color)
                 gate.rfid = rfid
                 gate.source = source
                 gate.status = GATE_AVAILABLE if status == "ready" else GATE_EMPTY if status == "empty" or status == "runout" else GATE_UNKNOWN
 
+                # Base layer (unconditional, no global mode flag): RFID/SKU data.
+                # spool_id is deliberately never touched here - MmuAceGate's own
+                # -1 "no spool" default stands, so an untouched RFID gate can
+                # never fabricate an ID that collides with a real Spoolman spool
+                # that happens to share the same number.
+                gate.material = type
+                gate.filament_name = type
+                gate.color = rgb_to_rgba(color) if color and len(color) >= 3 else [0, 0, 0, 0]
+
                 # Set temperature from RFID tag if available, otherwise use material default
                 if temp_data and isinstance(temp_data, dict) and "min" in temp_data:
-                    # Store both min and max from RFID tag
                     gate.temperature_min = temp_data.get("min", -1)
                     gate.temperature_max = temp_data.get("max", -1)
-                    # Use min temperature as default (more conservative)
                     gate.temperature = gate.temperature_min
-                    logging.info(f"Gate {index}: Using RFID temperatures min={gate.temperature_min}°C, max={gate.temperature_max}°C")
+                    logging.debug(f"[mmu_ace] Gate {index}: RFID temp min={gate.temperature_min}°C max={gate.temperature_max}°C")
                 elif type:
-                    # Fallback to material-based default (no min/max range for defaults)
                     gate.temperature = get_material_temperature(type)
                     gate.temperature_min = -1
                     gate.temperature_max = -1
-                    logging.info(f"Gate {index}: Using material default temperature {gate.temperature}°C for {type}")
+                    logging.debug(f"[mmu_ace] Gate {index}: material default temp {gate.temperature}°C for {type}")
 
-                # Parse SKU for additional information
+                # Parse SKU for vendor, series, filament_name (not spool_id - see above)
                 gate.sku = sku
                 if sku:
                     sku_info = parse_anycubic_sku(sku)
                     gate.vendor = sku_info["vendor"]
                     gate.series = sku_info["series"]
                     gate.color_name = sku_info["color_name"]
-                    # Use serial number as spool_id if available
-                    try:
-                        gate.spool_id = int(sku_info["serial"]) if sku_info["serial"] else abs(hash(sku)) % (2**31)
-                    except:
-                        gate.spool_id = abs(hash(sku)) % (2**31)
-
-                    # Update filament_name with full description if parsed
                     if sku_info["vendor"] and sku_info["series"]:
                         parts = [sku_info["vendor"], sku_info["series"], sku_info["material_type"]]
                         if sku_info["color_name"]:
                             parts.append(sku_info["color_name"])
                         gate.filament_name = " ".join(parts)
-                else:
-                    gate.spool_id = 0
+
+                # Layer 2: local manual override, highest priority when present.
+                # Auto-invalidated if the tag now reports a different SKU than it
+                # did when the override was set (physical spool swapped without
+                # updating the gate mapping) - restoring RFID as the source of
+                # truth for that gate again.
+                override = self._gate_spool_overrides.get(index)
+                if override is not None:
+                    recorded_sku = override.get("sku_at_link", "")
+                    if sku and recorded_sku and sku != recorded_sku:
+                        logging.info(f"[mmu_ace] Gate {index}: spool swapped ({recorded_sku!r} -> {sku!r}), clearing override")
+                        del self._gate_spool_overrides[index]
+                        self._save_gate_spool_overrides()
+                        override = None
+
+                # This has to restore every field every poll: gate objects are
+                # rebuilt from scratch above on each ACE status update, so
+                # anything not restored here would revert to "Unknown"/RFID data
+                # the moment the next poll arrives.
+                if override is not None:
+                    gate.spool_id = override.get("spool_id", -1)
+                    if "material" in override:
+                        gate.material = override["material"]
+                    if "filament_name" in override:
+                        gate.filament_name = override["filament_name"]
+                    if "color" in override:
+                        gate.color = override["color"]
+                    if "temperature" in override:
+                        gate.temperature = override["temperature"]
+                    if "vendor" in override:
+                        gate.vendor = override["vendor"]
+                # Layer 3: Spoolman pull cache, only when no local override applies.
+                # Cache is always empty outside spoolman_support: pull, so this
+                # never needs its own mode check.
+                elif index in self._spoolman_pull_cache:
+                    cached = self._spoolman_pull_cache[index]
+                    gate.spool_id = cached.get("spool_id", -1)
+                    if cached.get("material"):
+                        gate.material = cached["material"]
+                    if cached.get("filament_name"):
+                        gate.filament_name = cached["filament_name"]
+                    if cached.get("color"):
+                        gate.color = cached["color"]
+                    if cached.get("temperature") is not None:
+                        gate.temperature = cached["temperature"]
+                    if cached.get("vendor"):
+                        gate.vendor = cached["vendor"]
+                # else: base layer (RFID data, or defaults if untagged) stands.
+
+                logging.debug(
+                    f"[mmu_ace] Gate {index}: status={status} rfid={rfid} "
+                    f"material={gate.material!r} filament={gate.filament_name!r} "
+                    f"spool_id={gate.spool_id} color={gate.color} temp={gate.temperature}°C"
+                )
 
                 unit.gates.append(gate)
 
@@ -1387,7 +1785,7 @@ class MmuAceController:
                 endless_spool_enabled = True,  # Enable endless spool for backup roll functionality
                 reason_for_pause = "",
                 extruder_filament_remaining = -1,
-                spoolman_support = "off",  # off/readonly/push/pull - we don't use spoolman
+                spoolman_support = self._spoolman_support,
                 sensors = {},
                 espooler_active = "",
                 servo = "",
@@ -1490,6 +1888,30 @@ class MmuAceController:
         self.ace.ttg_map = ttg_map
         self._handle_status_update(force=False)  # Debounce for UI edits
 
+    async def _fetch_spoolman_spool(self, spool_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a spool record from Spoolman's own REST API (GET /v1/spool/{id}).
+
+        Returns None (logging a warning) if spoolman isn't configured, isn't
+        reachable, or has no record for this ID - callers should fall back to
+        their own locally-provided data in that case.
+        """
+        spoolman = self.server.lookup_component('spoolman', None)
+        http_client = self.server.lookup_component('http_client', None)
+        if spoolman is None or http_client is None:
+            return None
+        try:
+            response = await http_client.get(
+                f"{spoolman.spoolman_url}/v1/spool/{spool_id}",
+                connect_timeout=1., request_timeout=2.
+            )
+            if response.has_error():
+                logging.warning(f"[mmu_ace] Spoolman lookup for spool {spool_id} failed: {response.status_code}")
+                return None
+            return response.json()
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Spoolman lookup for spool {spool_id} failed: {e}")
+            return None
+
     async def update_gate(self,
                           gate_index: int,
                           status: int = GATE_EMPTY,
@@ -1513,11 +1935,32 @@ class MmuAceController:
         if color is None:
             color = [0, 0, 0, 0]
 
-        if gate.rfid == 2:
-            logging.warning(f"update gate {gate_index} not allowed, RFID tag is locked")
-            return
-
+        # Manual gate editing is always allowed now, on every gate, regardless of
+        # whether it currently has a physical RFID tag - the edit becomes the
+        # gate's local override and takes priority over RFID on every subsequent
+        # poll (see _set_ace_status), until the tag reports a different SKU
+        # (physical spool swapped), at which point the override auto-clears.
         logging.debug(f"updating gate {gate_index} (rfid={gate.rfid})")
+
+        # Linking a real Spoolman spool is authoritative for what's loaded, so pull
+        # its actual filament/material/color/temperature rather than trusting
+        # whatever the caller happened to pass (mirrors Happy Hare's own behavior:
+        # "if a SpoolID is available, pull attributes from spoolman and set the
+        # other elements of the gate map"). Falls back to the caller's values if
+        # Spoolman is unreachable or the spool doesn't exist, so the call still
+        # succeeds locally.
+        vendor = gate.vendor
+        if spool_id > 0:
+            spool = await self._fetch_spoolman_spool(spool_id)
+            if spool is not None:
+                fields = await self._spool_record_to_gate_fields(spool)
+                filament_name = fields.get("filament_name", filament_name)
+                material = fields.get("material", material)
+                vendor = fields.get("vendor", "")
+                if "temperature" in fields:
+                    temperature = fields["temperature"]
+                if "color" in fields:
+                    color = fields["color"]
 
         # Update local gate values immediately for UI responsiveness
         gate.status = status
@@ -1525,8 +1968,38 @@ class MmuAceController:
         gate.material = material
         gate.color = color
         gate.temperature = temperature
+        gate.vendor = vendor
         gate.spool_id = spool_id
         gate.speed_override = speed_override
+
+        # Persist the full record so it survives status updates - _set_ace_status
+        # rebuilds gate objects from scratch on every ACE poll, so spool_id alone
+        # isn't enough: material/filament_name/color/temperature/vendor need to be
+        # restored too, or they'd revert to "Unknown" the moment the next poll runs.
+        # Always persisted now, even without a linked spool_id, so a bare manual
+        # edit survives the next poll too. sku_at_link records the tag's SKU at
+        # edit time so a later physical spool swap (different SKU) can be
+        # detected and auto-clear this override.
+        previous_spool_id = self._gate_spool_overrides.get(gate_index, {}).get("spool_id", -1)
+        self._gate_spool_overrides[gate_index] = {
+            "spool_id": spool_id,
+            "material": material,
+            "filament_name": filament_name,
+            "color": color,
+            "temperature": temperature,
+            "vendor": vendor,
+            "sku_at_link": gate.sku,
+        }
+        self._save_gate_spool_overrides()
+
+        if self._spoolman_support in ("push", "pull"):
+            try:
+                if spool_id > 0:
+                    await self._spoolman_set_gate(spool_id, gate_index)
+                elif previous_spool_id > 0:
+                    await self._spoolman_unset_gate(previous_spool_id)
+            except Exception as e:
+                logging.warning(f"[mmu_ace] Failed to sync gate {gate_index} assignment to Spoolman: {e}")
 
         # Try to sync with GoKlipper (only works if gate has RFID tag)
         # {"method":"filament_hub/set_filament_info","params":{"color":{"B":65,"G":209,"R":254},"id":0,"index":2,"type":"PLA"},"id":34}
@@ -1566,7 +2039,12 @@ class MmuAcePatcher:
         self.kobra = self.server.load_component(self.server.config, 'kobra')
 
         host = config.get("host", None)
-        self.ace_controller = MmuAceController(self.server, host)
+        spoolman_support = config.get("spoolman_support", "off")
+        if spoolman_support not in ("off", "push", "pull"):
+            logging.warning(f"[mmu_ace] Invalid spoolman_support {spoolman_support!r}, falling back to 'off'")
+            spoolman_support = "off"
+        printer_name = config.get("printer_name", None)
+        self.ace_controller = MmuAceController(self.server, host, spoolman_support, printer_name)
 
         # Tracks the single in-flight auto-feed poller (issue #464). patch_print_data
         # runs inside kobra.py's network retry loop, so without tracking, a retried
@@ -1588,7 +2066,7 @@ class MmuAcePatcher:
         self.server.register_endpoint("/server/filament_hub/set_fan_speed", ['POST'], self._handle_set_fan_speed)
 
         # mmu status update notification
-        self.server.register_notification("mmu_ace:status_update")
+        self.server.register_notification("mmu_ace:status_update", "mmu_ace_status_update")
 
         # gcode handlers
         self.register_gcode_handler("MMU_GATE_MAP", self._on_gcode_mmu_gate_map)

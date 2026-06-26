@@ -947,21 +947,38 @@ class Kobra:
         logging.info('> Patched Machine.exec_sudo_command')
 
     def patch_spoolman(self):
-        from .spoolman import SpoolManager
+        async def handle_gcode_set_spool(args: dict, delegate_run_gcode):
+            spool_id = args.get('S') or args.get('SPOOL_ID') or args.get('ID')
+            if spool_id is None:
+                return await delegate_run_gcode()
+            spoolman = self.server.lookup_component('spoolman', None)
+            if spoolman is None:
+                logging.warning('[Kobra] M555/SET_ACTIVE_SPOOL: spoolman component not available')
+                return None
+            try:
+                spoolman.set_active_spool(spool_id=int(spool_id))
+                logging.info(f'[Kobra] Active spool set to {spool_id}')
+            except Exception as e:
+                logging.warning(f'[Kobra] Failed to set active spool {spool_id}: {e}')
+            return None
 
-        def wrap_set_active_spool(original_set_active_spool):
-            def set_active_spool(me, spool_id = None, SPOOL_ID = None):
-                if spool_id is None:
-                    logging.info('[Kobra] Injected SPOOL_ID')
-                    spool_id = int(SPOOL_ID)
-                return original_set_active_spool(me, spool_id)
-            return set_active_spool
+        async def handle_gcode_clear_spool(args: dict, delegate_run_gcode):
+            spoolman = self.server.lookup_component('spoolman', None)
+            if spoolman is None:
+                logging.warning('[Kobra] CLEAR_ACTIVE_SPOOL: spoolman component not available')
+                return None
+            try:
+                spoolman.set_active_spool(spool_id=None)
+                logging.info('[Kobra] Active spool cleared')
+            except Exception as e:
+                logging.warning(f'[Kobra] Failed to clear active spool: {e}')
+            return None
 
-        logging.info('> Allowing SPOOL_ID parameter...')
-
-        logging.debug(f'  Before: {SpoolManager.set_active_spool}')
-        setattr(SpoolManager, 'set_active_spool', wrap_set_active_spool(SpoolManager.set_active_spool))
-        logging.debug(f'  After: {SpoolManager.set_active_spool}')
+        # Register gcode macros M555, SET_ACTIVE_SPOOL, CLEAR_ACTIVE_SPOOL (klipper/moonraker)
+        # No guarantee spoolman is registered before kobra so register regardless of lookup_component
+        self.register_gcode_handler('M555', handle_gcode_set_spool)
+        self.register_gcode_handler('SET_ACTIVE_SPOOL', handle_gcode_set_spool)
+        self.register_gcode_handler('CLEAR_ACTIVE_SPOOL', handle_gcode_clear_spool)
 
     def patch_simplyprint(self):
         from ..server import Server
@@ -1352,7 +1369,15 @@ class Kobra:
                         "bed_mesh",
                         "bed_mesh default",
                         "bed_mesh \"default\"",
-                        "idle_timeout"
+                        "idle_timeout",
+                        # Synthetic objects injected by MmuAcePatcher.patch_status - not
+                        # real GoKlipper objects, so they must be listed explicitly here
+                        # or no client ever learns to subscribe to them. Without this,
+                        # Fluidd's objects.list-driven subscription never includes them,
+                        # so gate/spool changes are computed correctly server-side but
+                        # never reach any client's UI (confirmed live: 2026-07-13).
+                        "mmu",
+                        "mmu_machine"
                     ]
 
                     # For KS1M: Do not expose motion_report to avoid GoKlipper panic:

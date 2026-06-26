@@ -54,6 +54,14 @@ class DummyWebRequest:
         return self._endpoint
 
 
+class DummySpoolman:
+    def __init__(self):
+        self.calls = []
+
+    def set_active_spool(self, spool_id):
+        self.calls.append(spool_id)
+
+
 def _ensure_package(name: str):
     if name not in sys.modules:
         package = types.ModuleType(name)
@@ -191,6 +199,61 @@ class KobraMachineRebootPatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(scheduled, [])
         self.assertEqual(machine.original_calls, [])
+
+
+class KobraSpoolmanPatchTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_kobra_module()
+
+    def setUp(self):
+        self.kobra = self.module.Kobra.__new__(self.module.Kobra)
+        self.kobra.server = DummyServer()
+        self.kobra.gcode_handlers = {}
+        self.spoolman = DummySpoolman()
+        self.kobra.server.lookup_component = (
+            lambda name, default=None: self.spoolman if name == "spoolman" else default
+        )
+        self.kobra.patch_spoolman()
+
+    async def _run(self, cmd, args):
+        delegated = []
+
+        async def delegate():
+            delegated.append(True)
+            return "delegated"
+
+        result = await self.kobra.gcode_handlers[cmd](args, delegate)
+        return result, delegated
+
+    async def test_set_active_spool_sets_spool_id(self):
+        result, delegated = await self._run("SET_ACTIVE_SPOOL", {"ID": "5"})
+
+        self.assertIsNone(result)
+        self.assertEqual(self.spoolman.calls, [5])
+        self.assertEqual(delegated, [])
+
+    async def test_m555_without_param_delegates_to_original_handler(self):
+        result, delegated = await self._run("M555", {})
+
+        self.assertEqual(result, "delegated")
+        self.assertEqual(delegated, [True])
+        self.assertEqual(self.spoolman.calls, [])
+
+    async def test_clear_active_spool_clears_spool_id(self):
+        result, delegated = await self._run("CLEAR_ACTIVE_SPOOL", {})
+
+        self.assertIsNone(result)
+        self.assertEqual(self.spoolman.calls, [None])
+        self.assertEqual(delegated, [])
+
+    async def test_clear_active_spool_handles_missing_spoolman_component(self):
+        self.kobra.server.lookup_component = lambda name, default=None: default
+
+        result, delegated = await self._run("CLEAR_ACTIVE_SPOOL", {})
+
+        self.assertIsNone(result)
+        self.assertEqual(delegated, [])
 
 
 if __name__ == "__main__":
